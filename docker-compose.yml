@@ -1,0 +1,145 @@
+version: '3.8'
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+      - ETCD_ENABLE_V2=true
+      - ALLOW_NONE_AUTHENTICATION=yes
+    command:
+      - /usr/local/bin/etcd
+      - -advertise-client-urls=http://etcd:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - -listen-peer-urls=http://0.0.0.0:2380
+      - -name=etcd
+      - -data-dir=/etcd
+    ports:
+      - "2379:2379"
+    volumes:
+      - ./src/db/etcd:/etcd
+
+  minio:
+    image: minio/minio:RELEASE.2023-12-20T01-00-02Z
+    environment:
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    command: server /minio_data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./src/db/minio:/minio_data
+
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    depends_on: [etcd, minio]
+    ports: ["19530:19530", "9091:9091"]
+    volumes: ['./src/db/milvus:/var/lib/milvus']
+    
+  neo4j:
+    image: neo4j:5.15
+    ports: ["7474:7474", "7687:7687"]
+    environment:
+      NEO4J_AUTH: neo4j/password
+    volumes: ['./src/db/neo4j:/data']
+  
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: analytics
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  
+  mongodb:
+    image: mongo:7
+    ports: ["27017:27017"]
+    environment:
+      MONGO_INITDB_DATABASE: marketing_db
+    volumes:
+      - mongodb_data:/data/db
+  
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    depends_on:
+      - milvus
+      - neo4j
+      - redis
+      - postgres
+      - mongodb
+    environment:
+      - MILVUS_HOST=milvus
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=password
+      - REDIS_HOST=redis
+      - POSTGRES_URI=postgresql://user:password@postgres:5432/analytics
+      - MONGODB_HOST=mongodb
+      - MONGODB_PORT=27017
+      - MONGODB_DATABASE=marketing_db
+      - ANALYTICS_DB_TYPE=postgresql
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=analytics
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+  
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: airflow
+    ports: ["8080:8080"]
+    volumes:
+      - ./src/dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./:/opt/airflow/project
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false
+      - MONGODB_HOST=mongodb
+      - MONGODB_PORT=27017
+      - MONGODB_DATABASE=marketing_db
+      - MILVUS_HOST=milvus
+      - NEO4J_URI=bolt://neo4j:7687
+      - POSTGRES_HOST=postgres
+    entrypoint: ["/opt/airflow/dags/airflow-entrypoint.sh"]
+    depends_on:
+      - postgres
+      - mongodb
+      - milvus
+      - neo4j
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dashboard
+    ports: ["8501:8501"]
+    volumes:
+      - ./data/reports:/app/data/reports
+    command: streamlit run src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+
+volumes:
+  postgres_data:
+  mongodb_data:
